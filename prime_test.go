@@ -41,6 +41,14 @@ func TestIsPrimeAgainstOracle(t *testing.T) {
 			t.Fatalf("IsPrime(%s) = %v, want %v (big oracle)", v, got, want)
 		}
 	}
+	// A dense band straddling 2^32 pins the seam between the plain-uint64 modmul
+	// (n < 2^32) and the Montgomery path (n >= 2^32) against the exact oracle.
+	for delta := int64(-4000); delta <= 4000; delta++ {
+		v := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 32), big.NewInt(delta))
+		if got, want := IsPrime(v), v.ProbablyPrime(0); got != want {
+			t.Fatalf("IsPrime(2^32%+d = %s) = %v, want %v (2^32 seam)", delta, v, got, want)
+		}
+	}
 	// A band just above 2^64 drives the arbitrary-precision path against the oracle.
 	base := new(big.Int).Lsh(big.NewInt(1), 64)
 	for i := int64(0); i < 5000; i++ {
@@ -454,15 +462,24 @@ func TestMillerRabinUint64Direct(t *testing.T) {
 	if !millerRabinUint64(7) {
 		t.Error("millerRabinUint64(7) should be prime")
 	}
-	// A genuine 30-bit prime (the isprime benchmark input, mrW4 band).
+	// A genuine 30-bit prime (the isprime benchmark input, mrW3 band, small path).
 	if !millerRabinUint64(982451653) {
 		t.Error("millerRabinUint64(982451653) should be prime")
 	}
-	// One prime from each larger magnitude band so mrWitnessesFor's tiers are all
-	// exercised: mrW6 (~1e12), mrW9 (~1e15) and mrW12 (~1e19).
-	for _, p := range []uint64{1000000000039, 1000000000000037, 18446744073709551557} {
+	// One prime from each larger magnitude band so every mrWitnessesFor tier — and
+	// therefore the Montgomery path (all are >= 2^32) — is exercised: mrW5 (~1e12),
+	// mrW7 (~1e14), mrW9 (~1e16) and mrW12 (just below 2^64).
+	for _, p := range []uint64{1000000000039, 100000000000031, 10000000000000061, 18446744073709551557} {
 		if !millerRabinUint64(p) {
 			t.Errorf("millerRabinUint64(%d) should be prime", p)
+		}
+	}
+	// Montgomery-path composites (both odd, > 2^32): one with a tiny factor the
+	// first witness rejects, and a hard semiprime of two ~1e9 primes, so the
+	// Montgomery reject is reached with n >= 2^32.
+	for _, c := range []uint64{3215031751 * 3, 982451651 * 982451653} {
+		if millerRabinUint64(c) {
+			t.Errorf("millerRabinUint64(%d) should be composite", c)
 		}
 	}
 }
