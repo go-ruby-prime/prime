@@ -6,9 +6,50 @@ package prime
 
 import (
 	"math/big"
+	"math/rand"
 	"reflect"
 	"testing"
 )
+
+// TestIsPrimeAgainstOracle is the correctness backstop for the optimized paths:
+// it checks IsPrime exhaustively over a small range against a plain sieve, then
+// over a wide random sample of the whole uint64 range and a band just above
+// 2^64 against math/big's Baillie–PSW (which is proven exact below 2^64). This
+// pins the word-size fast path and the arbitrary-precision path to an
+// independent reference across their full domains.
+func TestIsPrimeAgainstOracle(t *testing.T) {
+	const N = 200000
+	composite := make([]bool, N+1)
+	for i := 2; i*i <= N; i++ {
+		if !composite[i] {
+			for j := i * i; j <= N; j += i {
+				composite[j] = true
+			}
+		}
+	}
+	for n := 0; n <= N; n++ {
+		want := n >= 2 && !composite[n]
+		if got := IsPrime(big.NewInt(int64(n))); got != want {
+			t.Fatalf("IsPrime(%d) = %v, want %v (sieve)", n, got, want)
+		}
+	}
+	// Wide random sample of the uint64 fast path against the exact big oracle.
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < 20000; i++ {
+		v := new(big.Int).SetUint64(r.Uint64())
+		if got, want := IsPrime(v), v.ProbablyPrime(0); got != want {
+			t.Fatalf("IsPrime(%s) = %v, want %v (big oracle)", v, got, want)
+		}
+	}
+	// A band just above 2^64 drives the arbitrary-precision path against the oracle.
+	base := new(big.Int).Lsh(big.NewInt(1), 64)
+	for i := int64(0); i < 5000; i++ {
+		v := new(big.Int).Add(base, big.NewInt(i))
+		if got, want := IsPrime(v), v.ProbablyPrime(20); got != want {
+			t.Fatalf("IsPrime(2^64+%d) = %v, want %v (big oracle)", i, got, want)
+		}
+	}
+}
 
 // bi parses a base-10 string into a *big.Int (test helper).
 func bi(t *testing.T, s string) *big.Int {
@@ -369,6 +410,14 @@ func TestInternalHelpers(t *testing.T) {
 	if jacobi(big.NewInt(2), big.NewInt(7)) != 1 {
 		t.Error("jacobi(2,7) != 1")
 	}
+	// jacobi(2,5): the factor-of-2 reduction with n ≡ 5 (mod 8) flips the sign.
+	if jacobi(big.NewInt(2), big.NewInt(5)) != -1 {
+		t.Error("jacobi(2,5) != -1")
+	}
+	// jacobi(3,7): both a and n ≡ 3 (mod 4), exercising the reciprocity flip.
+	if jacobi(big.NewInt(3), big.NewInt(7)) != -1 {
+		t.Error("jacobi(3,7) != -1")
+	}
 	// pollardRho on an even number returns 2 immediately.
 	if pollardRho(big.NewInt(8)).Int64() != 2 {
 		t.Error("pollardRho(8) != 2")
@@ -378,6 +427,87 @@ func TestInternalHelpers(t *testing.T) {
 	// which then yields 3 — exercising both the cycle-close break and the retry.
 	if d := pollardRho(big.NewInt(21)); d.Int64() != 3 && d.Int64() != 7 {
 		t.Errorf("pollardRho(21) = %v, want a proper factor", d)
+	}
+}
+
+// TestMillerRabinUint64Direct drives the deterministic word-size Miller–Rabin
+// on composites that IsPrime's small-factor trial division would otherwise
+// short-circuit, so every branch (the immediate-composite reject, the in-loop
+// n-1 break, the witness-equals-n skip and the prime accept) is exercised.
+func TestMillerRabinUint64Direct(t *testing.T) {
+	// Base-2 strong pseudoprime: the first witness passes (x==1 → continue), a
+	// later witness settles it immediately (no square reaches n-1).
+	if millerRabinUint64(2047) {
+		t.Error("millerRabinUint64(2047) should be composite")
+	}
+	// Composite whose squaring loop hits n-1 for an early witness (composite=false,
+	// break) before a later witness rejects it.
+	if millerRabinUint64(3277) {
+		t.Error("millerRabinUint64(3277) should be composite")
+	}
+	// Small odd composite rejected on the very first witness with no continue.
+	if millerRabinUint64(25) {
+		t.Error("millerRabinUint64(25) should be composite")
+	}
+	// Prime whose witness set contains a value equal to n (a%n==0 → skip) yet is
+	// still correctly reported prime: 7 is in the mrW4 base set {2,3,5,7}.
+	if !millerRabinUint64(7) {
+		t.Error("millerRabinUint64(7) should be prime")
+	}
+	// A genuine 30-bit prime (the isprime benchmark input, mrW4 band).
+	if !millerRabinUint64(982451653) {
+		t.Error("millerRabinUint64(982451653) should be prime")
+	}
+	// One prime from each larger magnitude band so mrWitnessesFor's tiers are all
+	// exercised: mrW6 (~1e12), mrW9 (~1e15) and mrW12 (~1e19).
+	for _, p := range []uint64{1000000000039, 1000000000000037, 18446744073709551557} {
+		if !millerRabinUint64(p) {
+			t.Errorf("millerRabinUint64(%d) should be prime", p)
+		}
+	}
+}
+
+// TestMillerRabinBase2Direct exercises the arbitrary-precision base-2 test's
+// three exits directly: the immediate 2^d ≡ ±1 accept, the in-loop square that
+// reaches n-1, and the composite reject.
+func TestMillerRabinBase2Direct(t *testing.T) {
+	if !millerRabinBase2(big.NewInt(7)) { // 2^3 ≡ 1 (mod 7): first branch
+		t.Error("millerRabinBase2(7) should pass")
+	}
+	if !millerRabinBase2(big.NewInt(17)) { // a later square reaches 16: loop branch
+		t.Error("millerRabinBase2(17) should pass")
+	}
+	if millerRabinBase2(big.NewInt(25)) { // never reaches n-1: false branch
+		t.Error("millerRabinBase2(25) should fail")
+	}
+}
+
+// TestIsPrimeBig drives IsPrime on values above 2^64, the only ones that take
+// the arbitrary-precision path: a Mersenne prime, a small-factor composite
+// (trial-division reject) and a large-factor composite (Baillie–PSW reject).
+func TestIsPrimeBig(t *testing.T) {
+	mers := bi(t, "170141183460469231731687303715884105727") // 2^127-1, prime
+	if !IsPrime(mers) {
+		t.Error("2^127-1 should be prime")
+	}
+	if IsPrime(new(big.Int).Mul(big.NewInt(3), mers)) { // small factor 3
+		t.Error("3*(2^127-1) should be composite")
+	}
+	// (1e9+7)(1e9+9)(1000003) ≈ 1e24 > 2^64, odd, no factor <= 997.
+	big3 := new(big.Int).Mul(new(big.Int).Mul(bi(t, "1000000007"), bi(t, "1000000009")), bi(t, "1000003"))
+	if IsPrime(big3) {
+		t.Error("1000000007*1000000009*1000003 should be composite")
+	}
+}
+
+// TestLucasStrongLargePrimes exercises the strong Lucas test (and the Jacobi /
+// Lucas-sequence helpers it drives) on large primes, whose longer binary
+// expansions reach the doubling-and-step branches shorter inputs never do.
+func TestLucasStrongLargePrimes(t *testing.T) {
+	for _, s := range []string{"1000000007", "9223372036854775783", "18446744073709551557"} {
+		if !lucasStrong(bi(t, s)) {
+			t.Errorf("lucasStrong(%s) should be true", s)
+		}
 	}
 }
 
