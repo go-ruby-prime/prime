@@ -12,16 +12,21 @@
 // (Prime.int_from_prime_division), all matching MRI byte-for-byte on the integer
 // value model.
 //
-// Primality uses a small wheel-assisted trial division for tiny inputs and a
-// deterministic Baillie–PSW test (a strong base-2 Miller–Rabin combined with a
-// strong Lucas test) for everything else. BPSW has no known counterexample and
-// is proven to have none below 2^64, so the result is exact across the entire
-// 64-bit range and a correct probable-prime test beyond it — exactly the
-// guarantee MRI's own generator relies on.
+// Primality uses a small wheel-assisted trial division for tiny inputs. Any
+// value that fits in a uint64 is then settled by a deterministic Miller–Rabin
+// test over the fixed witness set {2,3,5,7,11,13,17,19,23,29,31,37}, which is
+// proven to have no composite counterexample below 2^64 — the whole test runs
+// in machine-word arithmetic with no heap allocation. Genuinely larger values
+// fall through to a deterministic Baillie–PSW test (a strong base-2 Miller–Rabin
+// combined with a strong Lucas test) evaluated with math/big. Both paths agree
+// exactly on the 64-bit range (each is proven exact there) and BPSW remains a
+// correct probable-prime test beyond it — exactly the guarantee MRI's own
+// generator relies on.
 package prime
 
 import (
 	"math/big"
+	"math/bits"
 	"sync"
 )
 
@@ -52,39 +57,71 @@ func IsPrime(n *big.Int) bool {
 	if n == nil || n.Sign() < 1 {
 		return false
 	}
-	if n.Cmp(bigThree) <= 0 {
-		// 1 -> false, 2 -> true, 3 -> true.
-		return n.Cmp(bigOne) > 0
+	// Everything that fits in a machine word is settled allocation-free by the
+	// uint64 fast path (trial division then deterministic Miller–Rabin); only
+	// genuinely larger values need the arbitrary-precision Baillie–PSW test.
+	if n.IsUint64() {
+		return isPrimeUint64(n.Uint64())
 	}
+	return isPrimeBig(n)
+}
+
+// isPrimeBig is the arbitrary-precision path, taken only for n >= 2^64 (so n is
+// far above every small prime and the smallPrimeBound cut-off). It strips any
+// small factor, then applies deterministic Baillie–PSW.
+func isPrimeBig(n *big.Int) bool {
 	if n.Bit(0) == 0 {
-		return false // even and > 2
+		return false // even and >= 2^64
 	}
-	// Trial-divide by the small primes first; this both fast-paths small inputs
-	// and removes the small-factor cases the strong tests must not be asked about.
+	// Trial-divide by the small primes to remove the small-factor cases the strong
+	// tests must not be asked about.
 	for _, p := range smallPrimes {
 		if p == 2 {
 			continue
 		}
-		pp := big.NewInt(p)
-		if n.Cmp(pp) == 0 {
-			return true
-		}
-		m := new(big.Int).Mod(n, pp)
-		if m.Sign() == 0 {
+		if new(big.Int).Mod(n, big.NewInt(p)).Sign() == 0 {
 			return false
 		}
-	}
-	// For values within trial-division reach of the small-prime table there can be
-	// no remaining composite (largest small prime squared bounds it); otherwise run
-	// Baillie–PSW.
-	if n.Cmp(smallPrimeBound) <= 0 {
-		return true
 	}
 	return millerRabinBase2(n) && lucasStrong(n)
 }
 
+// isPrimeUint64 reports whether the machine-word value n is prime, matching
+// IsPrime exactly across the whole uint64 range. It trial-divides by the small
+// primes, decides conclusively when n is within their squared reach, and
+// otherwise runs deterministic Miller–Rabin — all in word arithmetic, no heap.
+func isPrimeUint64(n uint64) bool {
+	if n < 2 {
+		return false // 0, 1
+	}
+	if n < 4 {
+		return true // 2, 3
+	}
+	if n&1 == 0 {
+		return false // even and > 2
+	}
+	for _, p := range smallPrimes {
+		if p == 2 {
+			continue
+		}
+		pu := uint64(p)
+		if n == pu {
+			return true
+		}
+		if n%pu == 0 {
+			return false
+		}
+	}
+	// No factor <= 997: values up to 997^2 are therefore prime.
+	if n <= smallPrimeBoundU64 {
+		return true
+	}
+	return millerRabinUint64(n)
+}
+
 // smallPrimes is the trial-division wheel: primes up to 1000. smallPrimeBound is
-// the square of the largest, below which trial division alone is conclusive.
+// the square of the largest, below which trial division alone is conclusive;
+// smallPrimeBoundU64 is the same bound as a machine word for the uint64 path.
 var (
 	smallPrimes     = sievePrimes(1000)
 	smallPrimeBound = func() *big.Int {
@@ -92,7 +129,90 @@ var (
 		b := big.NewInt(last)
 		return b.Mul(b, b)
 	}()
+	smallPrimeBoundU64 = smallPrimeBound.Uint64()
 )
+
+// Miller–Rabin base sets. Each is proven to have no composite counterexample
+// below the paired bound (Jaeschke 1993; Sorenson & Webster 2015), so the fewer
+// bases a value's magnitude admits, the fewer modular exponentiations it costs
+// while staying exact. The final set is deterministic for the whole uint64 range.
+var (
+	mrW4  = []uint64{2, 3, 5, 7}
+	mrW6  = []uint64{2, 3, 5, 7, 11, 13}
+	mrW9  = []uint64{2, 3, 5, 7, 11, 13, 17, 19, 23}
+	mrW12 = []uint64{2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}
+)
+
+// mrWitnessesFor returns the smallest base set proven deterministic for n.
+func mrWitnessesFor(n uint64) []uint64 {
+	switch {
+	case n < 3215031751: // ~3.2e9
+		return mrW4
+	case n < 3474749660383: // ~3.5e12
+		return mrW6
+	case n < 3825123056546413051: // ~3.8e18
+		return mrW9
+	default:
+		return mrW12
+	}
+}
+
+// mulmod64 returns (a*b) mod m for m > 1 using a 128-bit intermediate, so it is
+// exact across the whole uint64 range without overflow.
+func mulmod64(a, b, m uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	// bits.Div64 requires the high word below the divisor; reducing hi mod m first
+	// preserves the result and guarantees the quotient fits in a uint64.
+	_, rem := bits.Div64(hi%m, lo, m)
+	return rem
+}
+
+// powmod64 returns (base^exp) mod m for m > 1 by square-and-multiply.
+func powmod64(base, exp, m uint64) uint64 {
+	result := uint64(1)
+	base %= m
+	for exp > 0 {
+		if exp&1 == 1 {
+			result = mulmod64(result, base, m)
+		}
+		base = mulmod64(base, base, m)
+		exp >>= 1
+	}
+	return result
+}
+
+// millerRabinUint64 is the deterministic Miller–Rabin test over mrWitnesses. n
+// must be odd and > 3; it is exact for every such n < 2^64.
+func millerRabinUint64(n uint64) bool {
+	// Write n-1 = d * 2^s with d odd.
+	d := n - 1
+	s := 0
+	for d&1 == 0 {
+		d >>= 1
+		s++
+	}
+	for _, a := range mrWitnessesFor(n) {
+		if a%n == 0 {
+			continue // witness is a multiple of n (only for tiny n) — skip it
+		}
+		x := powmod64(a, d, n)
+		if x == 1 || x == n-1 {
+			continue // probable prime for this base
+		}
+		composite := true
+		for r := 0; r < s-1; r++ {
+			x = mulmod64(x, x, n)
+			if x == n-1 {
+				composite = false
+				break
+			}
+		}
+		if composite {
+			return false
+		}
+	}
+	return true
+}
 
 // sievePrimes returns every prime <= limit via a simple sieve of Eratosthenes.
 func sievePrimes(limit int64) []int64 {
