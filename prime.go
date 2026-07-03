@@ -22,6 +22,7 @@ package prime
 
 import (
 	"math/big"
+	"sync"
 )
 
 // Pre-allocated big.Int constants reused throughout, to avoid re-parsing.
@@ -430,6 +431,84 @@ func Int(pairs [][2]*big.Int) *big.Int {
 	return result
 }
 
+// The sequential prime generator (Each / Take / First / EachPrime) is backed by
+// a process-wide memoized, incrementally-grown sieve — the analogue of MRI's
+// Prime singleton, whose EratosthenesGenerator caches an ever-growing table of
+// discovered primes so repeated enumerations never redo work. Without this cache
+// each enumeration re-ran a full Baillie–PSW primality test (with big.Int
+// trial division allocating hundreds of temporaries) per candidate, which made
+// small enumerations an order of magnitude slower than the reference. The sieve
+// keeps int64 primes and only widens; primeMu guards it.
+var (
+	primeMu sync.Mutex
+	// cachedPrimes holds every prime <= sievedTo, in ascending order. It only
+	// grows (append-only, never reordered), so a snapshot of the slice header
+	// taken under the lock stays valid to read after the lock is released.
+	cachedPrimes = []int64{2}
+	sievedTo     = int64(2)
+)
+
+// growPrimesUpToLocked extends cachedPrimes to include every prime <= limit.
+// primeMu must be held. It sieves in segments whose top never exceeds the
+// square of the currently-known ceiling, so cachedPrimes always already holds
+// the base primes (those <= sqrt(top)) each segment needs.
+func growPrimesUpToLocked(limit int64) {
+	for sievedTo < limit {
+		newTop := limit
+		if maxByBase := sievedTo * sievedTo; newTop > maxByBase {
+			newTop = maxByBase
+		}
+		sieveSegmentLocked(sievedTo+1, newTop)
+		sievedTo = newTop
+	}
+}
+
+// growPrimesCountLocked extends cachedPrimes until it holds at least n primes.
+// primeMu must be held.
+func growPrimesCountLocked(n int) {
+	for len(cachedPrimes) < n {
+		top := sievedTo * 2
+		if top < 16 {
+			top = 16
+		}
+		growPrimesUpToLocked(top)
+	}
+}
+
+// sieveSegmentLocked sieves the closed range [lo, hi] using the already-known
+// base primes and appends every prime it finds to cachedPrimes in ascending
+// order. primeMu must be held; callers guarantee 2 <= lo <= hi and that
+// cachedPrimes covers all primes <= sqrt(hi).
+func sieveSegmentLocked(lo, hi int64) {
+	seg := make([]bool, hi-lo+1) // false = still prime
+	for _, p := range cachedPrimes {
+		if p*p > hi {
+			break
+		}
+		start := p * p
+		if start < lo {
+			start = ((lo + p - 1) / p) * p
+		}
+		for j := start; j <= hi; j += p {
+			seg[j-lo] = true
+		}
+	}
+	for i := int64(0); i < int64(len(seg)); i++ {
+		if !seg[i] {
+			cachedPrimes = append(cachedPrimes, lo+i)
+		}
+	}
+}
+
+// primeAt returns the idx-th prime (0 -> 2, 1 -> 3, ...), growing the cache as
+// needed. It locks primeMu.
+func primeAt(idx int) int64 {
+	primeMu.Lock()
+	defer primeMu.Unlock()
+	growPrimesCountLocked(idx + 1)
+	return cachedPrimes[idx]
+}
+
 // Each yields every prime p with p <= ubound, in ascending order, calling yield
 // for each. If yield returns false, iteration stops early. This is the bounded
 // form of Ruby's Prime.each(ubound) { |p| ... }; the unbounded generator is
@@ -440,7 +519,14 @@ func Each(ubound int64, yield func(p *big.Int) bool) {
 	if ubound < 2 {
 		return
 	}
-	for _, p := range sievePrimes(ubound) {
+	primeMu.Lock()
+	growPrimesUpToLocked(ubound)
+	snap := cachedPrimes // append-only backing array: safe to read unlocked
+	primeMu.Unlock()
+	for _, p := range snap {
+		if p > ubound {
+			return
+		}
 		if !yield(big.NewInt(p)) {
 			return
 		}
@@ -453,11 +539,13 @@ func Take(n int) []*big.Int {
 	if n <= 0 {
 		return []*big.Int{}
 	}
-	out := make([]*big.Int, 0, n)
-	it := EachPrime()
+	primeMu.Lock()
+	growPrimesCountLocked(n)
+	out := make([]*big.Int, n)
 	for i := 0; i < n; i++ {
-		out = append(out, it())
+		out[i] = big.NewInt(cachedPrimes[i])
 	}
+	primeMu.Unlock()
 	return out
 }
 
@@ -466,13 +554,14 @@ func First(n int) []*big.Int { return Take(n) }
 
 // EachPrime returns a stateful generator: each call returns the next prime,
 // starting at 2 and continuing forever (it is the unbounded Prime.each
-// enumerator). It is the building block behind Take / First and the Prev / Next
-// cursor.
+// enumerator). It is the building block behind the Prev / Next cursor and reads
+// from the shared memoized sieve, so successive calls are amortised O(1).
 func EachPrime() func() *big.Int {
-	cur := big.NewInt(1)
+	idx := 0
 	return func() *big.Int {
-		cur = nextPrime(cur)
-		return new(big.Int).Set(cur)
+		p := primeAt(idx)
+		idx++
+		return big.NewInt(p)
 	}
 }
 
